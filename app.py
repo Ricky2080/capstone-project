@@ -1,10 +1,13 @@
 import os
 import json
+import pickle
 import joblib
 import uuid
 import pandas as pd
 from flask import Flask, jsonify, request
-from peewee import Model, CharField, BooleanField, TextField, SqliteDatabase
+from peewee import (
+    Model, IntegerField, FloatField, BooleanField, CharField, TextField
+)
 from playhouse.shortcuts import model_to_dict
 from playhouse.db_url import connect
 import logging
@@ -18,10 +21,11 @@ class CustomRailwayLogFormatter(logging.Formatter):
             "message": record.getMessage()
         }
         return json.dumps(log_record)
+    
 
 def get_logger():
     logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.INFO) # this should be just "logger.setLevel(logging.INFO)" but markdown is interpreting it wrong here...
     handler = logging.StreamHandler()
     for handler in logger.handlers[:]:
         logger.removeHandler(handler)
@@ -30,14 +34,17 @@ def get_logger():
     logger.addHandler(handler)
     return logger
 
+
 logger = get_logger()
 
 ########################################
 # Begin database stuff
 
-DATABASE_URL = os.environ.get('DATABASE_URL') or 'sqlite:///predictions.db'
-logger.info(f"Connecting to database at {DATABASE_URL}")
-DB = connect(DATABASE_URL)
+# The connect function checks if there is a DATABASE_URL env var.
+# If it exists, it uses it to connect to a remote postgres db.
+# Otherwise, it connects to a local sqlite db stored in predictions.db.
+
+DB = connect(os.environ.get('DATABASE_URL') or 'sqlite:///predictions.db')
 
 class Prediction(Model):
     id = CharField(primary_key=True, max_length=50)
@@ -47,29 +54,21 @@ class Prediction(Model):
 
     class Meta:
         database = DB
-        table_name = 'prediction'
 
-class APICallLog(Model):
+DB.create_tables([Prediction], safe=True)
+
+class API_call_log(Model):
     id = CharField(primary_key=True, max_length=50)
     log = TextField()
     
     class Meta:
         database = DB
-        table_name = 'api_call_log'
 
-def initialize_database():
-    try:
-        DB.connect(reuse_if_open=True)
-        DB.create_tables([Prediction, APICallLog], safe=True)
-        logger.info("Database initialized and tables created")
-    except Exception as e:
-        logger.error("Error initializing database: %s", str(e), exc_info=True)
-        raise
-
-initialize_database()
+DB.create_tables([API_call_log], safe=True)
 
 # End database stuff
 ########################################
+
 
 ########################################
 # Unpickle the previously-trained model
@@ -82,99 +81,190 @@ pipeline = joblib.load('pipeline.pickle')
 ########################################
 # Input validation functions
 
-def validate_observation(observation):
-    required_columns = {
-        'id', 'name', 'sex', 'dob', 'race', 
-        'juv_fel_count', 'juv_misd_count', 'juv_other_count',
-        'priors_count', 'c_case_number', 'c_charge_degree',
-        'c_charge_desc', 'c_offense_date', 'c_arrest_date', 'c_jail_in'
+
+def check_valid_column(observation):
+    """
+        Validates that our observation only has valid columns
+        
+        Returns:
+        - assertion value: True if all provided columns are valid, False otherwise
+        - error message: empty if all provided columns are valid, False otherwise
+    """
+    
+    valid_columns = {
+    'id',
+    'name',
+    'sex',
+    'dob',
+    'race', 
+    'juv_fel_count',
+    'juv_misd_count',
+    'juv_other_count',
+    'priors_count',
+    'c_case_number',
+    'c_charge_degree',
+    'c_charge_desc',
+    'c_offense_date',
+    'c_arrest_date',
+    'c_jail_in'
     }
-    valid_categories = {
-        "sex": {'Male', 'Female'},
-        "race": {'African-American', 'Asian', 'Caucasian', 'Hispanic', 'Native American', 'Others'}
-    }
-
-    missing_columns = required_columns - observation.keys()
-    if missing_columns:
-        return False, f"Missing columns: {missing_columns}"
-
-    invalid_columns = observation.keys() - required_columns
-    if invalid_columns:
-        return False, f"Invalid columns: {invalid_columns}"
-
-    for col, valid_values in valid_categories.items():
-        if observation[col] not in valid_values:
-            return False, f"Invalid value for {col}: {observation[col]}"
+    
+    keys = set(observation.keys())
+    
+    if len(valid_columns - keys) < 0: 
+        missing = valid_columns - keys
+        error = "Missing columns: {}".format(missing)
+        return False, error
+    
+    if len(keys - valid_columns) > 0: 
+        extra = keys - valid_columns
+        error = "Unrecognized columns provided: {}".format(extra)
+        return False, error    
 
     return True, ""
 
+def check_categorical_values(observation):
+    """
+        Validates that all categorical fields are in the observation and values are valid
+        
+        Returns:
+        - assertion value: True if all provided categorical columns contain valid values, 
+                           False otherwise
+        - error message: empty if all provided columns are valid, False otherwise
+    """
+    
+    valid_category_map = {
+        "sex": ['Male', 'Female'],
+        "race": ['African-American', 'Asian', 'Caucasian', 'Hispanic', 'Native American', 'Others'],
+    }
+    
+    for key, valid_categories in valid_category_map.items():
+        if key in observation:
+            value = observation[key]
+            if value not in valid_categories:
+                error = "Invalid value provided for {}: {}. Allowed values are: {}".format(
+                    key, value, ",".join(["'{}'".format(v) for v in valid_categories]))
+                return False, error
+        else:
+            error = "Categorical field {} missing"
+            return False, error
+
+    return True, ""
+
+
 ########################################
-# Flask app and endpoints
+# Begin webserver stuff
+
 
 app = Flask(__name__)
 
+def process_observation(observation):
+    logger.info("Processing observation, %s", observation)
+    # A lot of processing
+    return observation
+
+def log_api_call():
+    # Generate a unique ID for each call
+    call_id = str(uuid.uuid4())
+    # Prepare the log content
+    log_content = {
+        'method': request.method,
+        'url': request.url,
+        'headers': dict(request.headers),
+        'body': request.get_data(as_text=True)
+    }
+    # Store the log in the database
+    API_call_log.create(id=call_id, log=json.dumps(log_content))
+
+#@app.before_request
+#def before_request():
+#    log_api_call()
+
 @app.route('/will_recidivate/', methods=['POST'])
 def predict():
-    try:
-        obs_dict = request.get_json()
-        logger.info('Observation: %s', obs_dict)
-        _id = obs_dict.get('id')
-
-        is_valid, error_message = validate_observation(obs_dict)
-        if not is_valid:
-            return jsonify({'error': error_message}), 400
-
-        if not _id:
-            return jsonify({'error': 'id is required'}), 400
-
-        if Prediction.select().where(Prediction.id == _id).exists():
-            return jsonify({'error': 'id already exists'}), 400
-
-        obs = pd.DataFrame([obs_dict], columns=columns)
-        predicted_outcome = bool(pipeline.predict(obs)[0])
-        response = {'id': _id, 'outcome': predicted_outcome}
-
-        Prediction.create(
-            id=_id,
-            observation=json.dumps(obs_dict),
-            pred_class=predicted_outcome,
-        )
-        logger.info('Saved: %s', response)
+    obs_dict = request.get_json()
+    logger.info('Observation: %s', obs_dict)
+    _id = obs_dict['id']
+    observation = obs_dict
+    
+    # a single observation into a dataframe that will work with a pipeline.
+    #obs = pd.DataFrame([observation])
+    
+    columns_ok, error = check_valid_column(observation)
+    if not columns_ok:
+        response = {'error': error}
         return jsonify(response)
-    except Exception as e:
-        logger.error("Error in predict endpoint: %s", str(e), exc_info=True)
-        return jsonify({'error': str(e)}), 500
 
-@app.route('/recidivism_result/', methods['POST'])
-def update():
-    try:
-        obs = request.get_json()
-        logger.info('Observation: %s', obs)
-        _id = obs.get('id')
-        outcome = obs.get('outcome')
+    categories_ok, error = check_categorical_values(observation)
+    if not categories_ok:
+        response = {'error': error}
+        return jsonify(response)
 
-        if not _id:
-            return jsonify({'error': 'id is required'}), 400
-        if not Prediction.select().where(Prediction.id == _id).exists():
-            return jsonify({'error': 'id does not exist'}), 400
-
+    if not _id:
+        logger.warning('Returning error: no id provided')
+        return jsonify({'error': 'id is required'}), 400
+    
+    if Prediction.select().where(Prediction.id == _id).exists():
         prediction = Prediction.get(Prediction.id == _id)
-        prediction.true_class = outcome
+
+        # Update the prediction
+        prediction.observation = str(observation)
         prediction.save()
-        response = {'id': _id, 'outcome': outcome, 'predicted_outcome': prediction.pred_class}
-        logger.info('Updated: %s', response)
-        return jsonify(response)
-    except Exception as e:
-        logger.error("Error in update endpoint: %s", str(e), exc_info=True)
-        return jsonify({'error': str(e)}), 500
+
+        logger.warning('Returning error: already exists id %s', _id)
+        return jsonify({'error': 'id already exists'}), 400
+
+    try:
+        obs = pd.DataFrame([observation], columns=columns)
+    except ValueError as e:
+        logger.error('Returning error: %s', str(e), exc_info=True)
+        default_response = {'id': _id, 'outcome': False}
+        return jsonify(default_response), 200
+    
+    predicted_outcome = bool(pipeline.predict(obs))
+    response = {'id': _id, 'outcome': predicted_outcome}
+    p = Prediction(
+        id=_id,
+        observation=request.data,
+        pred_class=predicted_outcome,
+    )
+    p.save()
+    logger.info('Saved: %s', model_to_dict(p))
+    logger.info('Prediction: %s', response)
+
+    return jsonify(response)
+
+
+@app.route('/recidivism_result/', methods=['POST'])
+def update():
+    obs = request.get_json()
+    logger.info('Observation:', obs)
+    _id = obs['id']
+    outcome = obs['outcome']
+
+    if not _id:
+        logger.warning('Returning error: no id provided')
+        return jsonify({'error': 'id is required'}), 400
+    if not Prediction.select().where(Prediction.id == _id).exists():
+        logger.warning(f'Returning error: id {_id} does not exist in the database')
+        return jsonify({'error': 'id does not exist'}), 400
+    
+    p = Prediction.get(Prediction.id == _id)
+    p.true_class = outcome
+    p.save()
+    logger.info('Updated: %s', model_to_dict(p))
+    
+    predicted_outcome = p.pred_class
+    response = {'id': _id, 'outcome': outcome, 'predicted_outcome': predicted_outcome}
+    return jsonify(response)
+
+
 
 @app.route('/list-db-contents')
 def list_db_contents():
-    try:
-        return jsonify([model_to_dict(obs) for obs in Prediction.select()])
-    except Exception as e:
-        logger.error("Error in list-db-contents endpoint: %s", str(e), exc_info=True)
-        return jsonify({'error': str(e)}), 500
+    return jsonify([
+        model_to_dict(obs) for obs in Prediction.select()
+    ])
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', debug=True, port=5000)
+    app.run(host='0.0.0.0', debug=True, port=5000) # always check configured port
