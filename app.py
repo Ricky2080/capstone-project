@@ -4,7 +4,7 @@ import joblib
 import uuid
 import pandas as pd
 from flask import Flask, jsonify, request
-from peewee import Model, CharField, BooleanField, TextField, SqliteDatabase
+from peewee import Model, CharField, BooleanField, TextField
 from playhouse.shortcuts import model_to_dict
 from playhouse.db_url import connect
 import logging
@@ -36,6 +36,7 @@ logger = get_logger()
 # Begin database stuff
 
 DATABASE_URL = os.environ.get('DATABASE_URL') or 'sqlite:///predictions.db'
+logger.info(f"Connecting to database at {DATABASE_URL}")
 DB = connect(DATABASE_URL)
 
 class Prediction(Model):
@@ -56,9 +57,13 @@ class API_call_log(Model):
 
 # Ensure database connection is established and tables are created
 def initialize_database():
-    DB.connect(reuse_if_open=True)
-    DB.create_tables([Prediction, API_call_log], safe=True)
-    logger.info("Database initialized and tables created")
+    try:
+        DB.connect(reuse_if_open=True)
+        DB.create_tables([Prediction, API_call_log], safe=True)
+        logger.info("Database initialized and tables created")
+    except Exception as e:
+        logger.error("Error initializing database: %s", str(e), exc_info=True)
+        raise
 
 initialize_database()
 
@@ -128,15 +133,18 @@ def process_observation(observation):
     return observation
 
 def log_api_call():
-    call_id = str(uuid.uuid4())
-    log_content = {
-        'method': request.method,
-        'url': request.url,
-        'headers': dict(request.headers),
-        'body': request.get_data(as_text=True)
-    }
-    API_call_log.create(id=call_id, log=json.dumps(log_content))
-    DB.commit()  # Ensure commit of log entry
+    try:
+        call_id = str(uuid.uuid4())
+        log_content = {
+            'method': request.method,
+            'url': request.url,
+            'headers': dict(request.headers),
+            'body': request.get_data(as_text=True)
+        }
+        API_call_log.create(id=call_id, log=json.dumps(log_content))
+        DB.commit()  # Ensure commit of log entry
+    except Exception as e:
+        logger.error("Error logging API call: %s", str(e), exc_info=True)
 
 @app.route('/will_recidivate/', methods=['POST'])
 def predict():
