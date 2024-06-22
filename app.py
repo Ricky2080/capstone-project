@@ -180,7 +180,7 @@ def log_api_call():
 #def before_request():
 #    log_api_call()
 
-@app.route('/will_recidivate', methods=['POST'])
+@app.route('/will_recidivate/', methods=['POST'])
 def predict():
     obs_dict = request.get_json()
     logger.info('Observation: %s', obs_dict)
@@ -235,7 +235,7 @@ def predict():
     return jsonify(response)
 
 
-@app.route('/recidivism_result', methods=['POST'])
+@app.route('/recidivism_result/', methods=['POST'])
 def update():
     obs = request.get_json()
     logger.info('Observation:', obs)
