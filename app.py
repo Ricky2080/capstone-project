@@ -138,7 +138,7 @@ def check_categorical_values(observation):
     
     valid_category_map = {
         "sex": ["Male", "Female"],
-        "race": ["African-American", "Asian", "Caucasian", "Hispanic", "Native American", "Others"],
+        "race": ["African-American", "Asian", "Caucasian", "Hispanic", "Native American", "Other"],
     }
     
     for key, valid_categories in valid_category_map.items():
