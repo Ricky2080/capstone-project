@@ -47,7 +47,7 @@ logger = get_logger()
 DB = connect(os.environ.get('DATABASE_URL') or 'sqlite:///predictions.db')
 
 class Prediction(Model):
-    obs_id = TextField(unique=True)
+    id = CharField(primary_key=True, max_length=50)
     observation = TextField()
     pred_class = BooleanField()
     true_class = BooleanField(null=True)
@@ -58,7 +58,7 @@ class Prediction(Model):
 DB.create_tables([Prediction], safe=True)
 
 class API_call_log(Model):
-    log_id = CharField(primary_key=True, max_length=50)
+    id = CharField(primary_key=True, max_length=50)
     log = TextField()
     
     class Meta:
@@ -78,9 +78,6 @@ with open('columns.json') as fh:
 
 pipeline = joblib.load('pipeline.pickle')
 
-with open('dtypes.pickle', 'rb') as fh:
-    dtypes = pickle.load(fh)
-
 ########################################
 # Input validation functions
 
@@ -95,34 +92,34 @@ def check_valid_column(observation):
     """
     
     valid_columns = {
-    "id",
-    "name",
-    "sex",
-    "dob",
-    "race", 
-    "juv_fel_count",
-    "juv_misd_count",
-    "juv_other_count",
-    "priors_count",
-    "c_case_number",
-    "c_charge_degree",
-    "c_charge_desc",
-    "c_offense_date",
-    "c_arrest_date",
-    "c_jail_in"
+    'id',
+    'name',
+    'sex',
+    'dob',
+    'race', 
+    'juv_fel_count',
+    'juv_misd_count',
+    'juv_other_count',
+    'priors_count',
+    'c_case_number',
+    'c_charge_degree',
+    'c_charge_desc',
+    'c_offense_date',
+    'c_arrest_date',
+    'c_jail_in'
     }
     
     keys = set(observation.keys())
     
-    if len(valid_columns) - len(keys) > 0: 
+    if len(valid_columns - keys) < 0: 
         missing = valid_columns - keys
         error = "Missing columns: {}".format(missing)
         return False, error
     
-    if len(valid_columns)-len(keys) < 0: 
+    if len(keys - valid_columns) > 0: 
         extra = keys - valid_columns
         error = "Unrecognized columns provided: {}".format(extra)
-        return False, error 
+        return False, error    
 
     return True, ""
 
@@ -137,8 +134,8 @@ def check_categorical_values(observation):
     """
     
     valid_category_map = {
-        "sex": ["Male", "Female"],
-        "race": ["African-American", "Asian", "Caucasian", "Hispanic", "Native American", "Others"],
+        "sex": ['Male', 'Female'],
+        "race": ['African-American', 'Asian', 'Caucasian', 'Hispanic', 'Native American', 'Others'],
     }
     
     for key, valid_categories in valid_category_map.items():
@@ -161,10 +158,10 @@ def check_categorical_values(observation):
 
 app = Flask(__name__)
 
-#def process_observation(observation):
-#    logger.info("Processing observation, %s", observation)
-#    # A lot of processing
-#    return observation
+def process_observation(observation):
+    logger.info("Processing observation, %s", observation)
+    # A lot of processing
+    return observation
 
 def log_api_call():
     # Generate a unique ID for each call
@@ -177,7 +174,7 @@ def log_api_call():
         'body': request.get_data(as_text=True)
     }
     # Store the log in the database
-    API_call_log.create(log_id=call_id, log=json.dumps(log_content))
+    API_call_log.create(id=call_id, log=json.dumps(log_content))
 
 #@app.before_request
 #def before_request():
@@ -186,15 +183,12 @@ def log_api_call():
 @app.route('/will_recidivate/', methods=['POST'])
 def predict():
     obs_dict = request.get_json()
-    
-    # Check for empty JSON
-    if not obs_dict:
-        return jsonify({"error": "Empty JSON body provided."}), 400
-    
     logger.info('Observation: %s', obs_dict)
     _id = obs_dict['id']
-    
     observation = obs_dict
+    
+    # a single observation into a dataframe that will work with a pipeline.
+    #obs = pd.DataFrame([observation])
     
     columns_ok, error = check_valid_column(observation)
     if not columns_ok:
@@ -210,32 +204,33 @@ def predict():
         logger.warning('Returning error: no id provided')
         return jsonify({'error': 'id is required'}), 400
     
-    if Prediction.select().where(Prediction.obs_id == _id).exists():
+    if Prediction.select().where(Prediction.id == _id).exists():
+        prediction = Prediction.get(Prediction.id == _id)
+
+        # Update the prediction
+        #prediction.observation = str(observation)
+        #prediction.save()
+
         logger.warning('Returning error: already exists id %s', _id)
-        return jsonify({'error': 'id already exists in the database.'}), 400
+        return jsonify({'error': 'id already exists'}), 400
 
     try:
         obs = pd.DataFrame([observation], columns=columns)
     except ValueError as e:
         logger.error('Returning error: %s', str(e), exc_info=True)
-        return jsonify({'error': 'observation ValueError'}), 400
+        default_response = {'id': _id, 'outcome': False}
+        return jsonify(default_response), 200
     
     predicted_outcome = bool(pipeline.predict(obs))
     response = {'id': _id, 'outcome': predicted_outcome}
     p = Prediction(
-        obs_id=_id,
-        observation=obs_dict,
+        id=_id,
+        observation=request.data,
         pred_class=predicted_outcome,
     )
-    try:
-        p.save()
-        logger.info('Saved: %s', model_to_dict(p))
-        logger.info('Prediction: %s', response)
-    except IntegrityError:
-        error_msg = 'Observation ID: "{}" caused an unexpected database error while performing the insert operation'.format(_id)
-        response['error'] = error_msg
-        logger.error(error_msg)
-        DB.rollback()
+    p.save()
+    logger.info('Saved: %s', model_to_dict(p))
+    logger.info('Prediction: %s', response)
 
     return jsonify(response)
 
@@ -250,23 +245,17 @@ def update():
     if not _id:
         logger.warning('Returning error: no id provided')
         return jsonify({'error': 'id is required'}), 400
-    if not Prediction.select().where(Prediction.obs_id == _id).exists():
+    if not Prediction.select().where(Prediction.id == _id).exists():
         logger.warning(f'Returning error: id {_id} does not exist in the database')
         return jsonify({'error': 'id does not exist'}), 400
     
-    p = Prediction.get(Prediction.obs_id == _id)
+    p = Prediction.get(Prediction.id == _id)
     p.true_class = outcome
+    p.save()
+    logger.info('Updated: %s', model_to_dict(p))
     
-    try:
-        p.save()
-        logger.info('Updated: %s', model_to_dict(p))
-        predicted_outcome = p.pred_class
-        response = {'id': _id, 'outcome': outcome, 'predicted_outcome': predicted_outcome}
-    except IntegrityError:
-        error_msg = 'Observation ID: "{}" caused an unexpected database error while performing the update operation'.format(_id)
-        response['error'] = error_msg
-        logger.error(error_msg)
-        DB.rollback()
+    predicted_outcome = p.pred_class
+    response = {'id': _id, 'outcome': outcome, 'predicted_outcome': predicted_outcome}
     return jsonify(response)
 
 
